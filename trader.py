@@ -127,9 +127,10 @@ class Trader:
             return self.EMERALDS_FAIR
 
         if product == "TOMATOES":
-            # rolling mean fair value
+            # fair value of tomatoes is the average of 5 last mid value
             if len(history) >= 5:
                 return sum(history[-5:]) / 5
             return history[-1]
 
         return history[-1]
+
