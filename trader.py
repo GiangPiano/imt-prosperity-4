@@ -19,7 +19,11 @@ class Trader:
         for product in state.order_depths:
             order_depth: OrderDepth = state.order_depths[product]
             orders: List[Order] = []
-            acceptable_price = 10  # Participant should calculate this value
+            acceptable_price = 1000000000
+            if len(order_depth.sell_orders) > 0 and len(order_depth.buy_orders) > 0:
+                best_ask = min(order_depth.sell_orders.keys())
+                best_bid = max(order_depth.buy_orders.keys())
+                acceptable_price = (best_ask + best_bid) / 2
             print("Acceptable price : " + str(acceptable_price))
             print("Buy Order depth : " + str(len(order_depth.buy_orders)) + ", Sell order depth : " + str(len(order_depth.sell_orders)))
 
