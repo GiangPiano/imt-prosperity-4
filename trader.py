@@ -39,7 +39,9 @@ class Trader:
 
             # Current midpoint
             if best_bid is not None and best_ask is not None:
-                mid = (best_bid + best_ask) / 2
+                bid_vol = abs(order_depth.buy_orders[best_bid])
+                ask_vol = abs(order_depth.sell_orders[best_ask])
+                mid = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
             elif best_bid is not None:
                 mid = best_bid
             elif best_ask is not None:
@@ -127,11 +129,13 @@ class Trader:
             return self.EMERALDS_FAIR
 
         if product == "TOMATOES":
-            # fair value of tomatoes is the average of 5 last mid value
-            values_cnt = 19
-            if len(history) >= values_cnt:
-                return sum(history[-values_cnt:]) / values_cnt
-            return history[-1]
-
+            if not history:
+                return 0
+            # EMA implementation (alpha = 0.2 approx equals an 9-period SMA)
+            n = 18
+            alpha = 2 / (n + 1)
+            ema = history[0]
+            for price in history[1:]:
+                ema = alpha * price + (1 - alpha) * ema
+            return ema
         return history[-1]
-
