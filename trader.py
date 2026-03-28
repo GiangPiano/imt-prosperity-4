@@ -128,8 +128,9 @@ class Trader:
 
         if product == "TOMATOES":
             # fair value of tomatoes is the average of 5 last mid value
-            if len(history) >= 5:
-                return sum(history[-5:]) / 5
+            values_cnt = 19
+            if len(history) >= values_cnt:
+                return sum(history[-values_cnt:]) / values_cnt
             return history[-1]
 
         return history[-1]
