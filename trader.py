@@ -1,46 +1,136 @@
-from datamodel import OrderDepth, UserId, TradingState, Order
-from typing import List
-import string
+from datamodel import OrderDepth, TradingState, Order
+from typing import List, Dict
+import json
+
 
 class Trader:
+    POSITION_LIMITS = {
+        "EMERALDS": 20,
+        "TOMATOES": 20,
+    }
 
-    def bid(self):
-        return 15
+    EMERALDS_FAIR = 10000
 
     def run(self, state: TradingState):
-        """Only method required. It takes all buy and sell orders for all
-        symbols as an input, and outputs a list of orders to be sent."""
+        result: Dict[str, List[Order]] = {}
 
-        print("traderData: " + state.traderData)
-        print("Observations: " + str(state.observations))
+        # Load saved history
+        trader_data = {}
+        if state.traderData:
+            try:
+                trader_data = json.loads(state.traderData)
+            except Exception:
+                trader_data = {}
 
-        # Orders to be placed on exchange matching engine
-        result = {}
-        for product in state.order_depths:
-            order_depth: OrderDepth = state.order_depths[product]
+        price_history = trader_data.get("price_history", {})
+
+        for product, order_depth in state.order_depths.items():
             orders: List[Order] = []
-            acceptable_price = 1000000000
-            if len(order_depth.sell_orders) > 0 and len(order_depth.buy_orders) > 0:
-                best_ask = min(order_depth.sell_orders.keys())
-                best_bid = max(order_depth.buy_orders.keys())
-                acceptable_price = (best_ask + best_bid) / 2
-            print("Acceptable price : " + str(acceptable_price))
-            print("Buy Order depth : " + str(len(order_depth.buy_orders)) + ", Sell order depth : " + str(len(order_depth.sell_orders)))
 
-            if len(order_depth.sell_orders) != 0:
-                best_ask, best_ask_amount = list(order_depth.sell_orders.items())[0]
-                if int(best_ask) < acceptable_price:
-                    print("BUY", str(-best_ask_amount) + "x", best_ask)
-                    orders.append(Order(product, best_ask, -best_ask_amount))
+            position = state.position.get(product, 0)
+            limit = self.POSITION_LIMITS.get(product, 20)
 
-            if len(order_depth.buy_orders) != 0:
-                best_bid, best_bid_amount = list(order_depth.buy_orders.items())[0]
-                if int(best_bid) > acceptable_price:
-                    print("SELL", str(best_bid_amount) + "x", best_bid)
-                    orders.append(Order(product, best_bid, -best_bid_amount))
+            if product not in price_history:
+                price_history[product] = []
+
+            # Best prices
+            best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
+            best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
+
+            # Current midpoint
+            if best_bid is not None and best_ask is not None:
+                mid = (best_bid + best_ask) / 2
+            elif best_bid is not None:
+                mid = best_bid
+            elif best_ask is not None:
+                mid = best_ask
+            else:
+                result[product] = []
+                continue
+
+            # Save price history
+            price_history[product].append(mid)
+            price_history[product] = price_history[product][-20:]  # keep last 20 mids
+
+            # Fair value
+            fair = self.get_fair_value(product, price_history[product])
+
+            # Inventory skew:
+            # if long, lower fair to encourage selling
+            # if short, raise fair to encourage buying
+            skew = 0.1 * position
+            fair -= skew
+
+            # --- 1) TAKE favorable prices aggressively ---
+
+            # Buy from asks that are cheap relative to fair
+            if order_depth.sell_orders:
+                for ask_price in sorted(order_depth.sell_orders.keys()):
+                    ask_volume = -order_depth.sell_orders[ask_price]  # convert to positive size
+
+                    # only buy if price is clearly good
+                    if ask_price < fair - 1:
+                        buy_qty = min(ask_volume, limit - position)
+                        if buy_qty > 0:
+                            orders.append(Order(product, ask_price, buy_qty))
+                            position += buy_qty
+
+            # Sell into bids that are rich relative to fair
+            if order_depth.buy_orders:
+                for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
+                    bid_volume = order_depth.buy_orders[bid_price]
+
+                    if bid_price > fair + 1:
+                        sell_qty = min(bid_volume, position + limit)
+                        if sell_qty > 0:
+                            orders.append(Order(product, bid_price, -sell_qty))
+                            position -= sell_qty
+
+            # --- 2) PASSIVE MARKET MAKING ---
+            # Quote around fair if we still have inventory room
+
+            buy_capacity = limit - position
+            sell_capacity = position + limit
+
+            # choose quote width by product
+            if product == "EMERALDS":
+                half_spread = 2
+                quote_size = 4
+            else:  # TOMATOES
+                half_spread = 2
+                quote_size = 3
+
+            bid_quote = int(fair - half_spread)
+            ask_quote = int(fair + half_spread)
+
+            # Improve inside market slightly when sensible
+            if best_bid is not None:
+                bid_quote = min(bid_quote, best_bid + 1)
+            if best_ask is not None:
+                ask_quote = max(ask_quote, best_ask - 1)
+
+            # Avoid crossing ourselves accidentally
+            if bid_quote < ask_quote:
+                if buy_capacity > 0:
+                    orders.append(Order(product, bid_quote, min(quote_size, buy_capacity)))
+                if sell_capacity > 0:
+                    orders.append(Order(product, ask_quote, -min(quote_size, sell_capacity)))
 
             result[product] = orders
 
-        traderData = ""  # No state needed - we check position directly
+        trader_data = json.dumps({"price_history": price_history})
         conversions = 0
-        return result, conversions, traderData
+        return result, conversions, trader_data
+
+    def get_fair_value(self, product: str, history: List[float]) -> float:
+        if product == "EMERALDS":
+            return self.EMERALDS_FAIR
+
+        if product == "TOMATOES":
+            # fair value of tomatoes is the average of 5 last mid value
+            if len(history) >= 5:
+                return sum(history[-5:]) / 5
+            return history[-1]
+
+        return history[-1]
+
