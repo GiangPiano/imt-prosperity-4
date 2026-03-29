@@ -5,8 +5,8 @@ import json
 
 class Trader:
     POSITION_LIMITS = {
-        "EMERALDS": 20,
-        "TOMATOES": 20,
+        "EMERALDS": 80,
+        "TOMATOES": 80,
     }
 
     EMERALDS_FAIR = 10000
