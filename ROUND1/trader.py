@@ -1,263 +1,226 @@
 from datamodel import OrderDepth, TradingState, Order
-from typing import Dict, List, Optional
+from typing import List, Dict
 import json
-import statistics
 
 
 class Trader:
     POSITION_LIMITS = {
-        "ASH_COATED_OSMIUM": 80,
+        "ASH_COATED_OSMIUM":    80,
         "INTARIAN_PEPPER_ROOT": 80,
     }
 
-    OSMIUM_FAIR = 10000
-    PEPPER_SLOPE_PER_TIMESTAMP = 0.001  # fitted from sample data
+    ASH_FAIR = 10000
+
+    PEPPER_DAY_BASE = 12000
+
+    ENDGAME_TS = 160000
+    PANIC_TS   = 190000
 
     def run(self, state: TradingState):
         result: Dict[str, List[Order]] = {}
 
-        trader_data = self.load_data(state.traderData)
+        trader_data = {}
+        if state.traderData:
+            try:
+                trader_data = json.loads(state.traderData)
+            except:
+                trader_data = {}
 
-        # rolling history
-        anchors = trader_data.get("anchors", {})
-        mids = trader_data.get("mids", {})
+        price_history = trader_data.get("price_history", {})
 
-        for product, order_depth in state.order_depths.items():
-            if product not in self.POSITION_LIMITS:
-                result[product] = []
-                continue
+        if "ASH_COATED_OSMIUM" in state.order_depths:
+            result["ASH_COATED_OSMIUM"] = self._trade_ash(state)
 
-            if product not in anchors:
-                anchors[product] = []
-            if product not in mids:
-                mids[product] = []
+        if "INTARIAN_PEPPER_ROOT" in state.order_depths:
+            result["INTARIAN_PEPPER_ROOT"] = self._trade_pepper(state, price_history)
 
-            position = state.position.get(product, 0)
-            limit = self.POSITION_LIMITS[product]
-            orders: List[Order] = []
+        trader_data = json.dumps({"price_history": price_history})
+        return result, 0, trader_data
 
-            best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
-            best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
+    # ───────────────────────── ASH (Mean Reversion Pro) ─────────────────────────
 
-            if best_bid is None and best_ask is None:
-                result[product] = []
-                continue
+    def _trade_ash(self, state: TradingState) -> List[Order]:
+        depth    = state.order_depths["ASH_COATED_OSMIUM"]
+        position = state.position.get("ASH_COATED_OSMIUM", 0)
+        limit    = self.POSITION_LIMITS["ASH_COATED_OSMIUM"]
+        fair     = self.ASH_FAIR
 
-            mid = self.get_microprice(order_depth, best_bid, best_ask)
-            mids[product].append(mid)
-            mids[product] = mids[product][-50:]
-
-            fair = self.get_fair_value(
-                product=product,
-                timestamp=state.timestamp,
-                mid=mid,
-                anchors=anchors[product],
-                mids=mids[product],
-            )
-
-            # inventory skew
-            fair -= 0.12 * position
-
-            # signal strength / thresholds
-            if product == "ASH_COATED_OSMIUM":
-                take_edge = 1.0
-                base_half_spread = 2
-                quote_size = 8
-            else:
-                take_edge = 1.0
-                base_half_spread = 2
-                quote_size = 10
-
-            # 1) Aggressive taking
-            position, aggressive_orders = self.take_mispriced_orders(
-                product=product,
-                order_depth=order_depth,
-                fair=fair,
-                position=position,
-                limit=limit,
-                edge=take_edge,
-            )
-            orders.extend(aggressive_orders)
-
-            # 2) Passive market making
-            mm_orders = self.make_markets(
-                product=product,
-                order_depth=order_depth,
-                fair=fair,
-                position=position,
-                limit=limit,
-                base_half_spread=base_half_spread,
-                quote_size=quote_size,
-            )
-            orders.extend(mm_orders)
-
-            result[product] = orders
-
-        new_data = json.dumps({
-            "anchors": anchors,
-            "mids": mids,
-        })
-
-        conversions = 0
-        return result, conversions, new_data
-
-    def load_data(self, raw: str) -> dict:
-        if not raw:
-            return {}
-        try:
-            return json.loads(raw)
-        except Exception:
-            return {}
-
-    def get_microprice(
-        self,
-        order_depth: OrderDepth,
-        best_bid: Optional[int],
-        best_ask: Optional[int],
-    ) -> float:
-        if best_bid is not None and best_ask is not None:
-            bid_vol = abs(order_depth.buy_orders[best_bid])
-            ask_vol = abs(order_depth.sell_orders[best_ask])
-
-            if bid_vol + ask_vol > 0:
-                return (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
-            return (best_bid + best_ask) / 2
-
-        if best_bid is not None:
-            return float(best_bid)
-        return float(best_ask)
-
-    def get_fair_value(
-        self,
-        product: str,
-        timestamp: int,
-        mid: float,
-        anchors: List[float],
-        mids: List[float],
-    ) -> float:
-        if product == "ASH_COATED_OSMIUM":
-            # Very stable around 10000 in samples
-            return self.OSMIUM_FAIR
-
-        if product == "INTARIAN_PEPPER_ROOT":
-            # Estimate daily anchor from detrended mid:
-            # mid ≈ anchor + slope * timestamp
-            detrended = mid - self.PEPPER_SLOPE_PER_TIMESTAMP * timestamp
-            anchors.append(detrended)
-            anchors[:] = anchors[-60:]
-
-            # robust anchor estimate
-            if len(anchors) >= 5:
-                anchor = statistics.median(anchors[-25:])
-            else:
-                anchor = detrended
-
-            fair = anchor + self.PEPPER_SLOPE_PER_TIMESTAMP * timestamp
-
-            # tiny momentum/residual adjustment
-            if len(mids) >= 6:
-                short_ma = sum(mids[-3:]) / 3
-                long_ma = sum(mids[-6:]) / 6
-                fair += 0.25 * (short_ma - long_ma)
-
-            return fair
-
-        return mid
-
-    def take_mispriced_orders(
-        self,
-        product: str,
-        order_depth: OrderDepth,
-        fair: float,
-        position: int,
-        limit: int,
-        edge: float,
-    ):
         orders: List[Order] = []
 
-        # Buy cheap asks
-        for ask_price in sorted(order_depth.sell_orders.keys()):
-            ask_volume = -order_depth.sell_orders[ask_price]
-            if ask_price <= fair - edge:
-                buy_qty = min(ask_volume, limit - position)
-                if buy_qty > 0:
-                    orders.append(Order(product, ask_price, buy_qty))
-                    position += buy_qty
-            else:
-                break
+        if not depth.buy_orders or not depth.sell_orders:
+            return []
 
-        # Sell expensive bids
-        for bid_price in sorted(order_depth.buy_orders.keys(), reverse=True):
-            bid_volume = order_depth.buy_orders[bid_price]
-            if bid_price >= fair + edge:
-                sell_qty = min(bid_volume, position + limit)
-                if sell_qty > 0:
-                    orders.append(Order(product, bid_price, -sell_qty))
-                    position -= sell_qty
-            else:
-                break
+        best_bid = max(depth.buy_orders)
+        best_ask = min(depth.sell_orders)
 
-        return position, orders
+        # --- SNIPE (only real edge) ---
+        for bid in sorted(depth.buy_orders.keys(), reverse=True):
+            if bid >= fair + 2:
+                vol = min(depth.buy_orders[bid], position + limit)
+                if vol > 0:
+                    orders.append(Order("ASH_COATED_OSMIUM", bid, -vol))
+                    position -= vol
 
-    def make_markets(
-        self,
-        product: str,
-        order_depth: OrderDepth,
-        fair: float,
-        position: int,
-        limit: int,
-        base_half_spread: int,
-        quote_size: int,
-    ) -> List[Order]:
-        orders: List[Order] = []
+        for ask in sorted(depth.sell_orders.keys()):
+            if ask <= fair - 2:
+                vol = min(abs(depth.sell_orders[ask]), limit - position)
+                if vol > 0:
+                    orders.append(Order("ASH_COATED_OSMIUM", ask, vol))
+                    position += vol
 
-        best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
-        best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
+        # --- Inventory skew ---
+        skew = (position / limit) * 3
 
-        buy_capacity = limit - position
-        sell_capacity = position + limit
+        bid_quote = min(best_bid + 1, fair - 1 - skew)
+        ask_quote = max(best_ask - 1, fair + 1 - skew)
 
-        # inventory-aware widening
-        inv_ratio = abs(position) / max(limit, 1)
-        extra_widen = 1 if inv_ratio > 0.5 else 0
-        half_spread = base_half_spread + extra_widen
+        buy_cap  = limit - position
+        sell_cap = position + limit
 
-        # reservation-price style quotes
-        bid_quote = int(fair - half_spread)
-        ask_quote = int(fair + half_spread)
+        # --- Layered MM ---
+        if buy_cap > 0:
+            orders.append(Order("ASH_COATED_OSMIUM", round(bid_quote),
+                                min(10, buy_cap)))
+            if buy_cap > 10:
+                orders.append(Order("ASH_COATED_OSMIUM", round(bid_quote) - 2,
+                                    min(10, buy_cap - 10)))
 
-        # improve toward inside market when safe
-        if best_bid is not None:
-            bid_quote = min(max(bid_quote, best_bid + 1), int(fair - 1))
-        if best_ask is not None:
-            ask_quote = max(min(ask_quote, best_ask - 1), int(fair + 1))
-
-        if bid_quote >= ask_quote:
-            bid_quote = int(fair - 1)
-            ask_quote = int(fair + 1)
-
-        # inventory leaning
-        if position > 20:
-            bid_quote -= 1
-            ask_quote -= 1
-        elif position < -20:
-            bid_quote += 1
-            ask_quote += 1
-
-        # primary layer
-        if buy_capacity > 0:
-            size = min(quote_size, buy_capacity)
-            orders.append(Order(product, bid_quote, size))
-
-        if sell_capacity > 0:
-            size = min(quote_size, sell_capacity)
-            orders.append(Order(product, ask_quote, -size))
-
-        # secondary layer for more queue presence when inventory is light
-        if abs(position) < limit * 0.35:
-            if buy_capacity - quote_size > 0:
-                orders.append(Order(product, bid_quote - 1, min(quote_size // 2, buy_capacity - quote_size)))
-            if sell_capacity - quote_size > 0:
-                orders.append(Order(product, ask_quote + 1, -min(quote_size // 2, sell_capacity - quote_size)))
+        if sell_cap > 0:
+            orders.append(Order("ASH_COATED_OSMIUM", round(ask_quote),
+                                -min(10, sell_cap)))
+            if sell_cap > 10:
+                orders.append(Order("ASH_COATED_OSMIUM", round(ask_quote) + 2,
+                                    -min(10, sell_cap - 10)))
 
         return orders
+
+    # ───────────────────────── PEPPER (Alpha Engine) ─────────────────────────
+
+    def _trade_pepper(self, state: TradingState, price_history: dict) -> List[Order]:
+        depth = state.order_depths["INTARIAN_PEPPER_ROOT"]
+        position = state.position.get("INTARIAN_PEPPER_ROOT", 0)
+        limit = self.POSITION_LIMITS["INTARIAN_PEPPER_ROOT"]
+
+        orders: List[Order] = []
+
+        if not depth.buy_orders or not depth.sell_orders:
+            return []
+
+        best_bid = max(depth.buy_orders)
+        best_ask = min(depth.sell_orders)
+
+        bid_vol = abs(depth.buy_orders[best_bid])
+        ask_vol = abs(depth.sell_orders[best_ask])
+
+    # --- Microprice ---
+        microprice = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
+
+    # --- Init storage ---
+        if "pepper_state" not in price_history:
+            price_history["pepper_state"] = {
+                "est": microprice,
+                "var": 10,
+                "history": []
+            }
+
+        s = price_history["pepper_state"]
+
+    # --- Kalman update ---
+        est, var = self._kalman_update(s["est"], s["var"], microprice)
+        s["est"], s["var"] = est, var
+
+    # --- Save history ---
+        s["history"].append(microprice)
+        s["history"] = s["history"][-50:]
+
+        history = s["history"]
+
+    # --- Volatility ---
+        if len(history) > 5:
+            returns = [history[i] - history[i-1] for i in range(1, len(history))]
+            vol = sum(abs(r) for r in returns[-10:]) / 10
+        else:
+            vol = 2
+
+    # --- Imbalance ---
+        imbalance = (bid_vol - ask_vol) / (bid_vol + ask_vol)
+
+    # --- Final fair ---
+        fair = est + imbalance * 2
+
+    # --- Confidence (LOW var = HIGH confidence) ---
+        confidence = max(0.1, min(1, 10 / (var + 1)))
+
+    # --- Dynamic spread ---
+        spread = max(2, int(vol * 1.5))
+
+    # --- Inventory skew ---
+        skew = (position / limit) * spread
+
+        bid_quote = round(fair - spread - skew)
+        ask_quote = round(fair + spread - skew)
+
+        bid_quote = min(bid_quote, best_bid + 1)
+        ask_quote = max(ask_quote, best_ask - 1)
+
+    # --- Position sizing ---
+        base_size = int(10 + 20 * confidence)
+
+        buy_cap = limit - position
+        sell_cap = position + limit
+
+    # --- Snipe ---
+        for ask in sorted(depth.sell_orders.keys()):
+            if fair - ask > spread:
+                vol = min(abs(depth.sell_orders[ask]), buy_cap)
+                if vol > 0:
+                    orders.append(Order("INTARIAN_PEPPER_ROOT", ask, vol))
+                    position += vol
+                    buy_cap -= vol
+            else:
+                break
+
+        for bid in sorted(depth.buy_orders.keys(), reverse=True):
+            if bid - fair > spread:
+                vol = min(depth.buy_orders[bid], sell_cap)
+                if vol > 0:
+                    orders.append(Order("INTARIAN_PEPPER_ROOT", bid, -vol))
+                    position -= vol
+                    sell_cap -= vol
+            else:
+                break
+
+    # --- Layered MM ---
+        if bid_quote < ask_quote:
+            if buy_cap > 0:
+                orders.append(Order("INTARIAN_PEPPER_ROOT", bid_quote,
+                                min(base_size, buy_cap)))
+            if sell_cap > 0:
+                orders.append(Order("INTARIAN_PEPPER_ROOT", ask_quote,
+                                -min(base_size, sell_cap)))
+
+        return orders
+
+    # ───────────────────────── EMA ─────────────────────────
+
+    def _ema(self, history: List[float], n: int) -> float:
+        if not history:
+            return 0
+        alpha = 2 / (n + 1)
+        ema = history[0]
+        for p in history[1:]:
+            ema = alpha * p + (1 - alpha) * ema
+        return ema
+    def _kalman_update(self, prev_est, prev_var, price):
+        process_var = 1
+        meas_var = 4
+
+        pred_est = prev_est
+        pred_var = prev_var + process_var
+
+        K = pred_var / (pred_var + meas_var)
+
+        new_est = pred_est + K * (price - pred_est)
+        new_var = (1 - K) * pred_var
+
+        return new_est, new_var
